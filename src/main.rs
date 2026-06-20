@@ -18,17 +18,31 @@ struct Args {
 
 #[derive(clap_derive::Subcommand, Debug)]
 enum Commands {
+    /// Train a model
     Train {
+        /// name of the file to use for the output
         output_file: PathBuf,
+        /// the number of times the mnist dataset is used for training
         #[arg(short, default_value_t = 1)]
         epochs: usize,
+        /// how many images are used for a single training iteration
         #[arg(short, default_value_t = 1)]
         batch_size: usize,
+        /// which learning rate to start with
+        #[arg(short, default_value_t = 0.005)]
+        learning_rate: f32,
+        /// how big individual hidden layers should be
+        #[arg(long, num_args(0..))]
+        layers: Vec<usize>,
+        /// whether to use the cpu-algorithm or the gpu-algorithm
         #[arg(short, value_enum, default_value_t = CalcType::Cpu)]
         calc_type: CalcType,
     },
+    /// Test a model
     Test {
+        /// path to the file containing trained model
         input_file: PathBuf,
+        /// Not implemented for gpu bound testing
         #[arg(short, value_enum, default_value_t = CalcType::Cpu)]
         calc_type: CalcType,
     },
@@ -48,8 +62,10 @@ fn main() {
             output_file: out,
             epochs,
             batch_size,
+            learning_rate,
+            layers,
             calc_type,
-        } => train(out, epochs, batch_size, calc_type),
+        } => train(out, epochs, batch_size, learning_rate, layers, calc_type),
         Commands::Test {
             input_file: input,
             calc_type,
@@ -57,18 +73,36 @@ fn main() {
     }
 }
 
-fn train(output_file: PathBuf, epochs: usize, batch_size: usize, calc_type: CalcType) {
+fn train(
+    output_file: PathBuf,
+    epochs: usize,
+    batch_size: usize,
+    learning_rate: f32,
+    layers: Vec<usize>,
+    calc_type: CalcType,
+) {
     let pixel_data = include_bytes!("../data/train-images.idx3-ubyte");
     let label_data = include_bytes!("../data/train-labels.idx1-ubyte");
 
-    let learning_rate = 0.005;
-
     let mut a: Box<dyn NeuralNetwork> = match calc_type {
-        CalcType::Cpu => Box::new(NeuralNetworkCpu::new()),
+        CalcType::Cpu => Box::new(NeuralNetworkCpu::new(layers)),
         CalcType::Gpu => Box::new(pollster::block_on(NeuralNetworkGpu::new(
-            vec![50],
-            batch_size,
+            layers, batch_size,
         ))),
+    };
+
+    let train_bp = |a: &mut Box<dyn NeuralNetwork>, offset: usize, batch_size: usize| {
+        let (buf, label) = get_image(pixel_data, label_data, offset, batch_size);
+
+        let mut targets = Vec::new();
+
+        for target in label {
+            let mut data = vec![0f32; 10];
+            data[*target as usize] = 1.0;
+            targets.append(&mut data);
+        }
+
+        a.train(buf, &targets, batch_size, learning_rate);
     };
 
     for epoch in 1..=epochs {
@@ -77,36 +111,19 @@ fn train(output_file: PathBuf, epochs: usize, batch_size: usize, calc_type: Calc
                 print!("\rCurrently at epoch {epoch} {}%", i * batch_size / 600);
                 std::io::stdout().flush().unwrap();
             }
-            let (buf, label) = get_image(pixel_data, label_data, batch_size * i, batch_size);
 
-            let mut targets = Vec::new();
-
-            for target in label {
-                for i in 0..10 {
-                    if i == *target {
-                        targets.push(1.0);
-                    } else {
-                        targets.push(0.0);
-                    }
-                }
-            }
-
-            a.train(buf, &targets, batch_size, learning_rate);
+            train_bp(&mut a, batch_size * i, batch_size);
         }
 
         let leftover = 60000 % batch_size;
         if leftover == 0 {
             continue;
         }
-        let mut targets = Vec::new();
-        let (buf, label) = get_image(pixel_data, label_data, 60000 - leftover - 1, leftover);
-        for elem_label in 0..leftover {
-            let mut data = vec![0f32; 10];
-            data[label[elem_label] as usize] = 1.0;
-            targets.append(&mut data);
-        }
-        a.train(buf, &targets, leftover, learning_rate);
+
+        train_bp(&mut a, 60000 - leftover - 1, leftover);
     }
+    print!("\r\x1b[2Ksaving...");
+    std::io::stdout().flush().unwrap();
 
     let save = match calc_type {
         CalcType::Cpu => {

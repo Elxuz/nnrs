@@ -19,7 +19,7 @@ impl NeuralNetworkData {
     pub fn from_nn_cpu(network: &NeuralNetworkCpu) -> Self {
         let input_size = NeuralNetworkCpu::INPUT_NODES;
         let output_size = NeuralNetworkCpu::OUTPUT_NODES;
-        let hidden_layers = NeuralNetworkCpu::HIDDEN.to_vec();
+        let mut hidden_layers = Vec::new();
 
         let mut weights = Vec::new();
         let mut bias = Vec::new();
@@ -33,13 +33,21 @@ impl NeuralNetworkData {
                 }
             }
 
+            // HACK: recounting neurons based on size of bias
+            let mut neurons = 0;
             let l_bias = &layer.bias.data;
 
             for row in l_bias.row_iter() {
                 for num in row.iter() {
                     bias.push(*num);
+                    neurons += 1;
                 }
             }
+
+            if layer.is_output {
+                continue;
+            }
+            hidden_layers.push(neurons);
         }
 
         Self {

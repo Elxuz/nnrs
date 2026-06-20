@@ -10,24 +10,25 @@ pub struct NeuralNetworkCpu {
 impl NeuralNetworkCpu {
     pub const INPUT_NODES: usize = 28 * 28;
     pub const OUTPUT_NODES: usize = 10;
-    pub const HIDDEN: [usize; 3] = [70, 60, 50];
 
-    pub fn new() -> Self {
+    pub fn new(layer_sizes: Vec<usize>) -> Self {
         let mut layers = vec![];
 
-        for (i, layer_size) in Self::HIDDEN.iter().enumerate() {
+        for (i, layer_size) in layer_sizes.iter().enumerate() {
             let prev_layer_size = match i {
                 0 => Self::INPUT_NODES,
-                _ => Self::HIDDEN[i - 1],
+                _ => layer_sizes[i - 1],
             };
 
             layers.push(Layer::new(*layer_size, prev_layer_size));
         }
 
-        layers.push(Layer::new_output(
-            Self::OUTPUT_NODES,
-            *Self::HIDDEN.last().unwrap(),
-        ));
+        let prev_layer_size = match layer_sizes.len() {
+            0 => Self::INPUT_NODES,
+            _ => *layer_sizes.last().unwrap(),
+        };
+
+        layers.push(Layer::new_output(Self::OUTPUT_NODES, prev_layer_size));
 
         Self { layers }
     }
@@ -205,7 +206,7 @@ impl NeuralNetwork for NeuralNetworkCpu {
 pub struct Layer {
     pub bias: Tensor,
     pub weights: Tensor2D,
-    is_output: bool,
+    pub is_output: bool,
 
     prev_input: Option<Tensor2D>,
     prev_output: Option<Tensor2D>,
