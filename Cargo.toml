@@ -22,5 +22,5 @@ clap = "4.6.1"
 clap_derive = "4.6.1"
 
 [features]
-dev = []
+dev = ["print_gpu_debug"]
 print_gpu_debug = []

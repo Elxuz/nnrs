@@ -107,12 +107,7 @@ impl NeuralNetworkGpu {
         }
     }
 
-    pub fn calculate(
-        &mut self,
-        // encoder: &mut wgpu::CommandEncoder,
-        input_buffer: &wgpu::Buffer,
-        amount: usize,
-    ) -> wgpu::Buffer {
+    pub fn calculate(&mut self, input_buffer: &wgpu::Buffer, amount: usize) -> wgpu::Buffer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -134,10 +129,6 @@ impl NeuralNetworkGpu {
         }
 
         for layer in &self.layers {
-            let a_rows = amount as u32;
-            let a_cols = layer.input_nodes as u32;
-            let b_cols = layer.output_nodes as u32;
-
             print_buf!(
                 layer.weights_buffer,
                 (layer.input_nodes * layer.output_nodes * std::mem::size_of::<f32>()) as u64,
@@ -165,16 +156,9 @@ impl NeuralNetworkGpu {
                 mapped_at_creation: false,
             });
 
-            // dispatch shader matrix multiplication
-            let matmul_dims = MatrixUniforms {
-                a_rows,
-                a_cols,
-                b_cols,
-                padding: 0,
-            };
             self.dispatch_matmul(
                 &mut encoder,
-                matmul_dims,
+                layer,
                 &current_working_buffer,
                 &layer.weights_buffer,
                 &next_buffer,
@@ -182,21 +166,9 @@ impl NeuralNetworkGpu {
 
             // apply ReLU if it isn't the output layer
             if !layer.is_output {
-                self.dispatch_bias_relu(
-                    &mut encoder,
-                    a_rows,
-                    b_cols,
-                    &next_buffer,
-                    &layer.bias_buffer,
-                );
+                self.dispatch_bias_relu(&mut encoder, layer, &next_buffer, &layer.bias_buffer);
             } else {
-                self.dispatch_bias(
-                    &mut encoder,
-                    a_rows,
-                    b_cols,
-                    &next_buffer,
-                    &layer.bias_buffer,
-                );
+                self.dispatch_bias(&mut encoder, layer, &next_buffer, &layer.bias_buffer);
             }
 
             // save ouput far training
@@ -220,12 +192,7 @@ impl NeuralNetworkGpu {
 
         // call softmax on the output
         let last_layer = self.layers.last().unwrap();
-        self.dispatch_softmax(
-            &mut encoder,
-            amount as u32,
-            last_layer.output_nodes as u32,
-            &current_working_buffer,
-        );
+        self.dispatch_softmax(&mut encoder, last_layer, &current_working_buffer);
 
         self.queue.submit(Some(encoder.finish()));
 
@@ -319,12 +286,11 @@ impl NeuralNetworkGpu {
         });
 
         // calculate error
-        let last_layer_nodes = self.layers.last().unwrap().output_nodes;
+        let last_layer = self.layers.last().unwrap();
 
         self.dispatch_error_eval(
             &mut encoder,
-            batch_size,
-            last_layer_nodes as u32,
+            last_layer,
             &prediction_matrix_buf,
             &expected_targets_buf,
             &error_buf_a,
@@ -344,9 +310,7 @@ impl NeuralNetworkGpu {
             // caluclate delta gradient
             self.dispatch_delta_calc(
                 &mut encoder,
-                batch_size,
-                layer.output_nodes as u32,
-                layer.is_output,
+                layer,
                 current_input_error,
                 &layer.prev_output_buffer,
                 &layer.delta_buffer,
@@ -358,17 +322,10 @@ impl NeuralNetworkGpu {
                 "Delta: {:?}"
             );
 
-            let matmul_dims = MatrixTransposeUniforms {
-                a_rows: batch_size,
-                a_cols: layer.output_nodes as u32,
-                b_rows: layer.input_nodes as u32,
-                padding: 0,
-            };
-
             // prepare error gradient for next layer
             self.dispatch_matmul_transposed(
                 &mut encoder,
-                matmul_dims,
+                layer,
                 &layer.delta_buffer,
                 &layer.weights_buffer,
                 current_output_error,
@@ -1040,19 +997,11 @@ impl NeuralNetworkGpu {
     fn dispatch_matmul(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        dim: MatrixUniforms,
+        layer: &GpuLayer,
         buf_a: &wgpu::Buffer,
         buf_b: &wgpu::Buffer,
         buf_out: &wgpu::Buffer,
     ) {
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Temp MatMul Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1063,7 +1012,7 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.matmul_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1083,25 +1032,21 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.matmul_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(dim.b_cols.div_ceil(16), dim.a_rows.div_ceil(16), 1);
+        compute_pass.dispatch_workgroups(
+            (layer.output_nodes as u32).div_ceil(16),
+            (layer.max_batch_size as u32).div_ceil(16),
+            1,
+        );
     }
 
     fn dispatch_matmul_transposed(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        dim: MatrixTransposeUniforms,
+        layer: &GpuLayer,
         buf_a: &wgpu::Buffer,
         buf_b: &wgpu::Buffer,
         buf_out: &wgpu::Buffer,
     ) {
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Temp MatMul Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1112,7 +1057,7 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.matmul_transposed_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1132,26 +1077,20 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.matmul_transposed_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(dim.b_rows.div_ceil(16), dim.a_rows.div_ceil(16), 1);
+        compute_pass.dispatch_workgroups(
+            (layer.input_nodes as u32).div_ceil(16),
+            (layer.max_batch_size as u32).div_ceil(16),
+            1,
+        );
     }
 
     fn dispatch_bias(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        rows: u32,
-        cols: u32,
+        layer: &GpuLayer,
         matrix_buf: &wgpu::Buffer,
         bias_buf: &wgpu::Buffer,
     ) {
-        let dim = BiasUniforms { rows, cols };
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Temp Bias Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1162,7 +1101,7 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.bias_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1178,26 +1117,20 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.bias_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(dim.cols.div_ceil(16), dim.rows.div_ceil(16), 1);
+        compute_pass.dispatch_workgroups(
+            (layer.output_nodes as u32).div_ceil(16),
+            (layer.max_batch_size as u32).div_ceil(16),
+            1,
+        );
     }
 
     fn dispatch_bias_relu(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        rows: u32,
-        cols: u32,
+        layer: &GpuLayer,
         matrix_buf: &wgpu::Buffer,
         bias_buf: &wgpu::Buffer,
     ) {
-        let dim = BiasUniforms { rows, cols };
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Temp Bias Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1208,7 +1141,7 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.bias_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1224,25 +1157,19 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.bias_relu_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(dim.cols.div_ceil(16), dim.rows.div_ceil(16), 1);
+        compute_pass.dispatch_workgroups(
+            (layer.output_nodes as u32).div_ceil(16),
+            (layer.max_batch_size as u32).div_ceil(16),
+            1,
+        );
     }
 
     fn dispatch_softmax(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        rows: u32,
-        cols: u32,
+        layer: &GpuLayer,
         matrix_buf: &wgpu::Buffer,
     ) {
-        let dim = BiasUniforms { rows, cols };
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Temp Softmax Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1253,7 +1180,7 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.softmax_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1265,32 +1192,17 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.softmax_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(dim.rows.div_ceil(64), 1, 1);
+        compute_pass.dispatch_workgroups((layer.max_batch_size as u32).div_ceil(64), 1, 1);
     }
 
     fn dispatch_error_eval(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        batch_size: u32,
-        output_nodes: u32,
+        layer: &GpuLayer,
         pred_buf: &wgpu::Buffer,
         expected_buf: &wgpu::Buffer,
         out_error_buf: &wgpu::Buffer,
     ) {
-        assert!(batch_size != 0);
-        let size = batch_size * output_nodes;
-        let dim = ErrorUniforms {
-            size,
-            batch_size: batch_size as f32,
-        };
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Error Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1301,7 +1213,7 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.error_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1321,32 +1233,21 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.error_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(size.div_ceil(256), 1, 1);
+        compute_pass.dispatch_workgroups(
+            (layer.max_batch_size as u32 * layer.output_nodes as u32).div_ceil(256),
+            1,
+            1,
+        );
     }
 
     fn dispatch_delta_calc(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        batch_size: u32,
-        output_nodes: u32,
-        is_output: bool,
+        layer: &GpuLayer,
         error_grad_buf: &wgpu::Buffer,
         prev_out_buf: &wgpu::Buffer,
         delta_out_buf: &wgpu::Buffer,
     ) {
-        let size = batch_size * output_nodes;
-        let dim = DeltaUniforms {
-            size,
-            is_output: if is_output { 1 } else { 0 },
-        };
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Delta Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1357,7 +1258,7 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.delta_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1377,7 +1278,11 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.delta_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(size.div_ceil(256), 1, 1);
+        compute_pass.dispatch_workgroups(
+            (layer.max_batch_size as u32 * layer.output_nodes as u32).div_ceil(256),
+            1,
+            1,
+        );
     }
 
     fn dispatch_weight_update(
@@ -1482,16 +1387,28 @@ impl NeuralNetwork for NeuralNetworkGpu {
 }
 
 pub struct GpuLayer {
+    // actual data
     pub weights_buffer: wgpu::Buffer,
     pub bias_buffer: wgpu::Buffer,
 
+    // save states for training purposes
     pub prev_input_buffer: wgpu::Buffer,
     pub prev_output_buffer: wgpu::Buffer,
     pub delta_buffer: wgpu::Buffer,
 
+    // uniform buffers
+    pub matmul_uniform: wgpu::Buffer,
+    pub matmul_transposed_uniform: wgpu::Buffer,
+    pub bias_uniform: wgpu::Buffer,
+    pub softmax_uniform: wgpu::Buffer,
+    pub error_uniform: wgpu::Buffer,
+    pub delta_uniform: wgpu::Buffer,
+
+    // metadata
     pub is_output: bool,
     pub input_nodes: usize,
     pub output_nodes: usize,
+    pub max_batch_size: usize,
 }
 
 impl GpuLayer {
@@ -1547,15 +1464,84 @@ impl GpuLayer {
             mapped_at_creation: false,
         });
 
+        let matmul_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MatMul Uniform Buffer"),
+            contents: bytemuck::bytes_of(&MatrixUniforms {
+                a_rows: max_batch_size as u32,
+                a_cols: input_nodes as u32,
+                b_cols: output_nodes as u32,
+                padding: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let matmul_transposed_uniform =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("MatMul Transposed Uniform Buffer"),
+                contents: bytemuck::bytes_of(&MatrixTransposeUniforms {
+                    a_rows: max_batch_size as u32,
+                    a_cols: output_nodes as u32,
+                    b_rows: input_nodes as u32,
+                    padding: 0,
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bias_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Bias Uniform Buffer"),
+            contents: bytemuck::bytes_of(&BiasUniforms {
+                rows: max_batch_size as u32,
+                cols: output_nodes as u32,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let softmax_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Softmax Uniform Buffer"),
+            contents: bytemuck::bytes_of(&SoftmaxUniforms {
+                rows: max_batch_size as u32,
+                cols: output_nodes as u32,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let error_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Error Uniform Buffer"),
+            contents: bytemuck::bytes_of(&ErrorUniforms {
+                size: (max_batch_size * output_nodes) as u32,
+                batch_size: max_batch_size as f32,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let delta_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Delta Uniform Buffer"),
+            contents: bytemuck::bytes_of(&DeltaUniforms {
+                size: (max_batch_size * output_nodes) as u32,
+                is_output: if is_output { 1 } else { 0 },
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
         Self {
             weights_buffer,
             bias_buffer,
+
             prev_input_buffer,
             prev_output_buffer,
             delta_buffer,
+
+            matmul_uniform,
+            matmul_transposed_uniform,
+            bias_uniform,
+            softmax_uniform,
+            error_uniform,
+            delta_uniform,
+
             is_output,
             input_nodes,
             output_nodes,
+            max_batch_size,
         }
     }
 }
