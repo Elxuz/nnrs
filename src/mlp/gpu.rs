@@ -3,11 +3,17 @@ use wgpu::util::DeviceExt;
 use crate::mlp::NeuralNetwork;
 
 pub struct NeuralNetworkGpu {
+    // actual data
+    pub layers: Vec<GpuLayer>,
+
+    // device handles
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub layers: Vec<GpuLayer>,
+
+    // compute shaders
     pub matmul_pipeline: Option<wgpu::ComputePipeline>,
     pub matmul_transposed_pipeline: Option<wgpu::ComputePipeline>,
+    pub bias_pipeline: Option<wgpu::ComputePipeline>,
     pub bias_relu_pipeline: Option<wgpu::ComputePipeline>,
     pub softmax_pipeline: Option<wgpu::ComputePipeline>,
     pub error_pipeline: Option<wgpu::ComputePipeline>,
@@ -16,10 +22,11 @@ pub struct NeuralNetworkGpu {
 }
 
 impl NeuralNetworkGpu {
-    pub async fn new(layer_sizes: Vec<usize>, batch_size: usize) -> Self {
+    pub async fn new(layer_sizes: Vec<usize>, max_batch_size: usize) -> Self {
         let mut res = Self::init().await;
         res.create_matmul_pipeline();
         res.create_matmul_transposed_pipeline();
+        res.create_bias_pipeline();
         res.create_bias_relu_pipeline();
         res.create_softmax_pipeline();
         res.create_error_pipeline();
@@ -37,7 +44,7 @@ impl NeuralNetworkGpu {
                 *size,
                 &create_random_vec(*size * input_nodes),
                 &create_random_vec(*size),
-                batch_size,
+                max_batch_size,
                 false,
             );
             res.layers.push(layer);
@@ -54,7 +61,7 @@ impl NeuralNetworkGpu {
             10,
             &create_random_vec(10 * input_nodes),
             &create_random_vec(10),
-            batch_size,
+            max_batch_size,
             true,
         );
         res.layers.push(layer);
@@ -91,6 +98,7 @@ impl NeuralNetworkGpu {
             layers: Vec::new(),
             matmul_pipeline: None,
             matmul_transposed_pipeline: None,
+            bias_pipeline: None,
             bias_relu_pipeline: None,
             softmax_pipeline: None,
             error_pipeline: None,
@@ -99,7 +107,311 @@ impl NeuralNetworkGpu {
         }
     }
 
-    pub fn create_matmul_pipeline(&mut self) {
+    pub fn calculate(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        input_buffer: &wgpu::Buffer,
+        amount: usize,
+    ) -> wgpu::Buffer {
+        let mut current_working_buffer = input_buffer.clone();
+
+        for layer in &self.layers {
+            let a_rows = amount as u32;
+            let a_cols = layer.input_nodes as u32;
+            let b_cols = layer.output_nodes as u32;
+
+            // save input for training
+            let input_bytes = (amount * layer.input_nodes * std::mem::size_of::<f32>()) as u64;
+            encoder.copy_buffer_to_buffer(
+                &current_working_buffer,
+                0,
+                &layer.prev_input_buffer,
+                0,
+                input_bytes,
+            );
+
+            // create buffer that holds the matrix of the current layer
+            let output_bytes = (amount * layer.output_nodes * std::mem::size_of::<f32>()) as u64;
+            let next_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Intermediate Feature Map Buffer"),
+                size: output_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            // dispatch shader matrix multiplication
+            let matmul_dims = MatrixUniforms {
+                a_rows,
+                a_cols,
+                b_cols,
+                padding: 0,
+            };
+            self.dispatch_matmul(
+                encoder,
+                matmul_dims,
+                &current_working_buffer,
+                &layer.weights_buffer,
+                &next_buffer,
+            );
+
+            // apply ReLU if it isn't the output layer
+            if !layer.is_output {
+                self.dispatch_bias_relu(encoder, a_rows, b_cols, &next_buffer, &layer.bias_buffer);
+            } else {
+                self.dispatch_bias(encoder, a_rows, b_cols, &next_buffer, &layer.bias_buffer);
+            }
+
+            // save ouput far training
+            encoder.copy_buffer_to_buffer(
+                &next_buffer,
+                0,
+                &layer.prev_output_buffer,
+                0,
+                output_bytes,
+            );
+
+            // prepare for next layer
+            current_working_buffer = next_buffer;
+        }
+
+        // call softmax on the output
+        let last_layer = self.layers.last().unwrap();
+        self.dispatch_softmax(
+            encoder,
+            amount as u32,
+            last_layer.output_nodes as u32,
+            &current_working_buffer,
+        );
+
+        current_working_buffer
+    }
+
+    pub fn train(
+        &mut self,
+        raw_images: &[u8],
+        raw_targets: &[f32],
+        amount: usize,
+        learning_rate: f32,
+    ) {
+        let batch_size = amount as u32;
+
+        macro_rules! print_buf {
+            ($buf:expr, $buf_size:expr, $text: expr) => {
+                #[cfg(feature = "print_gpu_debug")]
+                {
+                    self.queue.submit(Some(encoder.finish()));
+
+                    let _res = self.download_matrix_from_gpu(&$buf, $buf_size);
+                    println!($text, _res);
+                    encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                }
+            };
+        }
+
+        // load data into vram
+        let input_image_buf = self.upload_images_to_gpu(raw_images, amount, 784);
+        let expected_targets_buf =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Expected Targets Buffer"),
+                    contents: bytemuck::cast_slice(raw_targets),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Main Training Batch Encoder Forwards Pass"),
+            });
+
+        // calculate prediction
+        let prediction_matrix_buf = self.calculate(&mut encoder, &input_image_buf, amount);
+
+        self.queue.submit(Some(encoder.finish()));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Main Training Batch Encoder Backwards Pass"),
+            });
+
+        // create two error buffers
+        let max_neurons = self
+            .layers
+            .iter()
+            .map(|layer| layer.output_nodes.max(layer.input_nodes))
+            .max()
+            .unwrap();
+        let max_error_bytes = (amount * max_neurons * std::mem::size_of::<f32>()) as u64;
+
+        let error_buf_a = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Global Error Gradient Buffer A"),
+            size: max_error_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let error_buf_b = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Global Error Gradient Buffer B"),
+            size: max_error_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // calculate error
+        let last_layer_nodes = self.layers.last().unwrap().output_nodes;
+
+        self.dispatch_error_eval(
+            &mut encoder,
+            batch_size,
+            last_layer_nodes as u32,
+            &prediction_matrix_buf,
+            &expected_targets_buf,
+            &error_buf_a,
+        );
+
+        let mut current_input_error = &error_buf_a;
+        let mut current_output_error = &error_buf_b;
+
+        // adjust weights and bias through back-propagation
+        for (i, layer) in self.layers.iter().enumerate().rev() {
+            // caluclate delta gradient
+            self.dispatch_delta_calc(
+                &mut encoder,
+                batch_size,
+                layer.output_nodes as u32,
+                layer.is_output,
+                current_input_error,
+                &layer.prev_output_buffer,
+                &layer.delta_buffer,
+            );
+
+            print_buf!(
+                layer.delta_buffer,
+                (amount * layer.output_nodes * std::mem::size_of::<f32>()) as u64,
+                "delta {i}: {:?}\n"
+            );
+
+            // update weights and bias
+            self.dispatch_weight_update(
+                &mut encoder,
+                batch_size,
+                layer.input_nodes as u32,
+                layer.output_nodes as u32,
+                learning_rate,
+                &layer.prev_input_buffer,
+                &layer.delta_buffer,
+                &layer.weights_buffer,
+                &layer.bias_buffer,
+            );
+
+            print_buf!(
+                layer.weights_buffer,
+                (layer.input_nodes * layer.output_nodes * std::mem::size_of::<f32>()) as u64,
+                "weights {i}: {:?}\n"
+            );
+
+            print_buf!(
+                layer.bias_buffer,
+                (layer.output_nodes * std::mem::size_of::<f32>()) as u64,
+                "bias {i}: {:?}\n"
+            );
+
+            if i != 0 {
+                let matmul_dims = MatrixTransposeUniforms {
+                    a_rows: batch_size,
+                    a_cols: layer.output_nodes as u32,
+                    b_rows: layer.input_nodes as u32,
+                    padding: 0,
+                };
+
+                // prepare error gradient for next layer
+                self.dispatch_matmul_transposed(
+                    &mut encoder,
+                    matmul_dims,
+                    &layer.delta_buffer,
+                    &layer.weights_buffer,
+                    current_output_error,
+                );
+
+                std::mem::swap(&mut current_input_error, &mut current_output_error);
+            }
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn upload_images_to_gpu(
+        &self,
+        raw_images: &[u8],
+        amount: usize,
+        input_nodes: usize,
+    ) -> wgpu::Buffer {
+        let normalized_f32s: Vec<f32> = raw_images
+            .iter()
+            .map(|&pixel| pixel as f32 / 255.0)
+            .collect();
+
+        assert!(normalized_f32s.len() == amount * input_nodes);
+
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("GPU Input Image Matrix (A x 784)"),
+                contents: bytemuck::cast_slice(&normalized_f32s),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            })
+    }
+
+    pub fn download_matrix_from_gpu(
+        &self,
+        gpu_buffer: &wgpu::Buffer,
+        buffer_size_bytes: u64,
+    ) -> Vec<f32> {
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Download Staging Buffer"),
+            size: buffer_size_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        encoder.copy_buffer_to_buffer(gpu_buffer, 0, &staging_buffer, 0, buffer_size_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
+            sender.send(v).unwrap();
+        });
+
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        pollster::block_on(receiver.receive()).unwrap().unwrap();
+
+        let data_view = buffer_slice.get_mapped_range();
+        let downloaded_data: Vec<f32> = bytemuck::cast_slice(&data_view).to_vec();
+
+        drop(data_view);
+        staging_buffer.unmap();
+
+        downloaded_data
+    }
+
+    fn create_matmul_pipeline(&mut self) {
         let shader_module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -175,7 +487,7 @@ impl NeuralNetworkGpu {
         ));
     }
 
-    pub fn create_matmul_transposed_pipeline(&mut self) {
+    fn create_matmul_transposed_pipeline(&mut self) {
         let shader_module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -253,7 +565,73 @@ impl NeuralNetworkGpu {
         ));
     }
 
-    pub fn create_bias_relu_pipeline(&mut self) {
+    fn create_bias_pipeline(&mut self) {
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Bias Shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/bias_add.wgsl").into()),
+            });
+
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bias Bind Goup Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Bias Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+
+        self.bias_pipeline = Some(self.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("Bias Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+        ))
+    }
+
+    fn create_bias_relu_pipeline(&mut self) {
         let shader_module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -321,7 +699,7 @@ impl NeuralNetworkGpu {
         ))
     }
 
-    pub fn create_softmax_pipeline(&mut self) {
+    fn create_softmax_pipeline(&mut self) {
         let shader_module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -377,7 +755,7 @@ impl NeuralNetworkGpu {
         ));
     }
 
-    pub fn create_error_pipeline(&mut self) {
+    fn create_error_pipeline(&mut self) {
         let shader_module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -451,7 +829,7 @@ impl NeuralNetworkGpu {
         ));
     }
 
-    pub fn create_delta_pipeline(&mut self) {
+    fn create_delta_pipeline(&mut self) {
         let shader_module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -525,7 +903,7 @@ impl NeuralNetworkGpu {
         ));
     }
 
-    pub fn create_update_pipeline(&mut self) {
+    fn create_update_pipeline(&mut self) {
         let shader_module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -607,245 +985,6 @@ impl NeuralNetworkGpu {
                 cache: None,
             },
         ));
-    }
-
-    pub fn calculate(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        input_buffer: &wgpu::Buffer,
-        amount: usize,
-    ) -> wgpu::Buffer {
-        let mut current_working_buffer = input_buffer.clone();
-
-        for layer in &self.layers {
-            let a_rows = amount as u32;
-            let a_cols = layer.input_nodes as u32;
-            let b_cols = layer.output_nodes as u32;
-
-            let input_bytes = (amount * layer.input_nodes * 4) as u64;
-            encoder.copy_buffer_to_buffer(
-                &current_working_buffer,
-                0,
-                &layer.prev_input_buffer,
-                0,
-                input_bytes,
-            );
-
-            let output_bytes = (amount * layer.output_nodes * 4) as u64;
-            let next_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Intermediate Feature Map Buffer"),
-                size: output_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let matmul_dims = MatrixUniforms {
-                a_rows,
-                a_cols,
-                b_cols,
-                padding: 0,
-            };
-            self.dispatch_matmul(
-                encoder,
-                matmul_dims,
-                &current_working_buffer,
-                &layer.weights_buffer,
-                &next_buffer,
-            );
-
-            if !layer.is_output {
-                self.dispatch_bias_relu(encoder, a_rows, b_cols, &next_buffer, &layer.bias_buffer);
-            }
-
-            encoder.copy_buffer_to_buffer(
-                &next_buffer,
-                0,
-                &layer.prev_output_buffer,
-                0,
-                output_bytes,
-            );
-
-            current_working_buffer = next_buffer;
-        }
-
-        let last_layer = self.layers.last().unwrap();
-        self.dispatch_softmax(
-            encoder,
-            amount as u32,
-            last_layer.output_nodes as u32,
-            &current_working_buffer,
-        );
-
-        current_working_buffer
-    }
-
-    pub fn train(
-        &mut self,
-        raw_images: &[u8],
-        raw_targets: &[f32],
-        amount: usize,
-        learning_rate: f32,
-    ) {
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Main Training Batch Encoder"),
-            });
-
-        let batch_size = amount as u32;
-
-        let input_image_buf = self.upload_images_to_gpu(raw_images, amount, 784);
-        let expected_targets_buf =
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Expected Targets Buffer"),
-                    contents: bytemuck::cast_slice(raw_targets),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-
-        // calculate prediction
-        let prediction_matrix_buf = self.calculate(&mut encoder, &input_image_buf, amount);
-
-        let last_layer_nodes = self.layers.last().unwrap().output_nodes;
-        let initial_error_bytes = (amount * last_layer_nodes * 4) as u64;
-        let mut error_grad_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Global Error Gradient Buffer"),
-            size: initial_error_bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // calculate error
-        self.dispatch_error_eval(
-            &mut encoder,
-            batch_size,
-            last_layer_nodes as u32,
-            &prediction_matrix_buf,
-            &expected_targets_buf,
-            &error_grad_buf,
-        );
-
-        for layer in self.layers.iter().rev() {
-            // caluclate delta gradient
-            self.dispatch_delta_calc(
-                &mut encoder,
-                batch_size,
-                layer.output_nodes as u32,
-                layer.is_output,
-                &error_grad_buf,
-                &layer.prev_output_buffer,
-                &layer.delta_buffer,
-            );
-
-            // update weights and bias
-            self.dispatch_weight_update(
-                &mut encoder,
-                batch_size,
-                layer.input_nodes as u32,
-                layer.output_nodes as u32,
-                learning_rate,
-                &layer.prev_input_buffer,
-                &layer.delta_buffer,
-                &layer.weights_buffer,
-                &layer.bias_buffer,
-            );
-
-            let next_error_bytes = (amount * layer.input_nodes * std::mem::size_of::<f32>()) as u64;
-            let next_error_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Transformed Layer Error Buffer"),
-                size: next_error_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let matmul_dims = MatrixTransposeUniforms {
-                a_rows: batch_size,
-                a_cols: layer.output_nodes as u32,
-                b_rows: layer.input_nodes as u32,
-                padding: 0,
-            };
-
-            // prepare error gradient for next layer
-            self.dispatch_matmul_transposed(
-                &mut encoder,
-                matmul_dims,
-                &layer.delta_buffer,
-                &layer.weights_buffer,
-                &next_error_buf,
-            );
-
-            error_grad_buf = next_error_buf;
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-    }
-
-    pub fn upload_images_to_gpu(
-        &self,
-        raw_images: &[u8],
-        amount: usize,
-        input_nodes: usize,
-    ) -> wgpu::Buffer {
-        let normalized_f32s: Vec<f32> = raw_images
-            .iter()
-            .map(|&pixel| pixel as f32 / 255.0)
-            .collect();
-
-        assert!(normalized_f32s.len() == amount * input_nodes);
-
-        self.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("GPU Input Image Matrix (A x 784)"),
-                contents: bytemuck::cast_slice(&normalized_f32s),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            })
-    }
-
-    pub fn download_matrix_from_gpu(
-        &self,
-        gpu_buffer: &wgpu::Buffer,
-        buffer_size_bytes: u64,
-    ) -> Vec<f32> {
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Download Staging Buffer"),
-            size: buffer_size_bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-        encoder.copy_buffer_to_buffer(gpu_buffer, 0, &staging_buffer, 0, buffer_size_bytes);
-        self.queue.submit(Some(encoder.finish()));
-
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
-            sender.send(v).unwrap();
-        });
-
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        pollster::block_on(receiver.receive()).unwrap().unwrap();
-
-        let data_view = buffer_slice.get_mapped_range();
-        let downloaded_data: Vec<f32> = bytemuck::cast_slice(&data_view).to_vec();
-
-        drop(data_view);
-        staging_buffer.unmap();
-
-        downloaded_data
     }
 
     fn dispatch_matmul(
@@ -944,6 +1083,52 @@ impl NeuralNetworkGpu {
         compute_pass.set_pipeline(self.matmul_transposed_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
         compute_pass.dispatch_workgroups(dim.b_rows.div_ceil(16), dim.a_rows.div_ceil(16), 1);
+    }
+
+    fn dispatch_bias(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        rows: u32,
+        cols: u32,
+        matrix_buf: &wgpu::Buffer,
+        bias_buf: &wgpu::Buffer,
+    ) {
+        let dim = BiasUniforms { rows, cols };
+        let uniform_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Temp Bias Uniform"),
+                contents: bytemuck::bytes_of(&dim),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self
+                .bias_pipeline
+                .as_ref()
+                .unwrap()
+                .get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: matrix_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bias_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        compute_pass.set_pipeline(self.bias_pipeline.as_ref().unwrap());
+        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.dispatch_workgroups(dim.cols.div_ceil(16), dim.rows.div_ceil(16), 1);
     }
 
     fn dispatch_bias_relu(

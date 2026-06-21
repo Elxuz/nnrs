@@ -89,7 +89,10 @@ impl NeuralNetworkData {
             layers.push(layer);
         }
 
-        let prev_layer_size = *self.hidden_layers.last().unwrap();
+        let prev_layer_size = match self.hidden_layers.len() {
+            0 => self.input_size,
+            _ => *self.hidden_layers.last().unwrap(),
+        };
 
         let mut layer = Layer::new_output(self.output_size, prev_layer_size);
 
