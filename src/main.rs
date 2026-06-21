@@ -87,7 +87,9 @@ fn train(
     let mut a: Box<dyn NeuralNetwork> = match calc_type {
         CalcType::Cpu => Box::new(NeuralNetworkCpu::new(layers)),
         CalcType::Gpu => Box::new(pollster::block_on(NeuralNetworkGpu::new(
-            layers, batch_size,
+            layers,
+            batch_size,
+            learning_rate,
         ))),
     };
 

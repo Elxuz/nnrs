@@ -19,10 +19,13 @@ pub struct NeuralNetworkGpu {
     pub error_pipeline: Option<wgpu::ComputePipeline>,
     pub delta_pipeline: Option<wgpu::ComputePipeline>,
     pub update_pipeline: Option<wgpu::ComputePipeline>,
+
+    // learning state
+    pub learning_state: Option<wgpu::Buffer>,
 }
 
 impl NeuralNetworkGpu {
-    pub async fn new(layer_sizes: Vec<usize>, max_batch_size: usize) -> Self {
+    pub async fn new(layer_sizes: Vec<usize>, max_batch_size: usize, learning_rate: f32) -> Self {
         let mut res = Self::init().await;
         res.create_matmul_pipeline();
         res.create_matmul_transposed_pipeline();
@@ -66,6 +69,14 @@ impl NeuralNetworkGpu {
         );
         res.layers.push(layer);
 
+        res.learning_state = Some(res.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Learning State Uniform"),
+                contents: bytemuck::bytes_of(&LearningState { learning_rate }),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            },
+        ));
+
         res
     }
 
@@ -104,6 +115,7 @@ impl NeuralNetworkGpu {
             error_pipeline: None,
             delta_pipeline: None,
             update_pipeline: None,
+            learning_state: None,
         }
     }
 
@@ -199,15 +211,7 @@ impl NeuralNetworkGpu {
         current_working_buffer
     }
 
-    pub fn train(
-        &mut self,
-        raw_images: &[u8],
-        raw_targets: &[f32],
-        amount: usize,
-        learning_rate: f32,
-    ) {
-        let batch_size = amount as u32;
-
+    pub fn train(&mut self, raw_images: &[u8], raw_targets: &[f32], amount: usize) {
         // load data into vram
         let input_image_buf = self.upload_images_to_gpu(raw_images, amount, 784);
         let expected_targets_buf =
@@ -334,10 +338,7 @@ impl NeuralNetworkGpu {
             // update weights and bias
             self.dispatch_weight_update(
                 &mut encoder,
-                batch_size,
-                layer.input_nodes as u32,
-                layer.output_nodes as u32,
-                learning_rate,
+                layer,
                 &layer.prev_input_buffer,
                 &layer.delta_buffer,
                 &layer.weights_buffer,
@@ -938,7 +939,7 @@ impl NeuralNetworkGpu {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -958,7 +959,7 @@ impl NeuralNetworkGpu {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -966,6 +967,16 @@ impl NeuralNetworkGpu {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -1288,29 +1299,12 @@ impl NeuralNetworkGpu {
     fn dispatch_weight_update(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        batch_size: u32,
-        input_nodes: u32,
-        output_nodes: u32,
-        learning_rate: f32,
+        layer: &GpuLayer,
         prev_input_buf: &wgpu::Buffer,
         delta_buf: &wgpu::Buffer,
         weigths_buf: &wgpu::Buffer,
         bias_buf: &wgpu::Buffer,
     ) {
-        let dim = UpdateUniforms {
-            batch_size,
-            input_nodes,
-            output_nodes,
-            learning_rate,
-        };
-        let uniform_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Update Uniform"),
-                contents: bytemuck::bytes_of(&dim),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -1321,22 +1315,26 @@ impl NeuralNetworkGpu {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
+                    resource: layer.update_uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prev_input_buf.as_entire_binding(),
+                    resource: self.learning_state.as_ref().unwrap().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: delta_buf.as_entire_binding(),
+                    resource: prev_input_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: weigths_buf.as_entire_binding(),
+                    resource: delta_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: weigths_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
                     resource: bias_buf.as_entire_binding(),
                 },
             ],
@@ -1345,7 +1343,11 @@ impl NeuralNetworkGpu {
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         compute_pass.set_pipeline(self.update_pipeline.as_ref().unwrap());
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(output_nodes.div_ceil(16), input_nodes.div_ceil(16), 1);
+        compute_pass.dispatch_workgroups(
+            (layer.output_nodes as u32).div_ceil(16),
+            (layer.input_nodes as u32).div_ceil(16),
+            1,
+        );
     }
 }
 
@@ -1355,9 +1357,9 @@ impl NeuralNetwork for NeuralNetworkGpu {
         raw_images: &[u8],
         label_data: &[f32],
         batch_size: usize,
-        learning_rate: f32,
+        _learning_rate: f32,
     ) {
-        self.train(raw_images, label_data, batch_size, learning_rate);
+        self.train(raw_images, label_data, batch_size);
     }
 
     fn test(&mut self, raw_image: &[u8], label: u32) -> bool {
@@ -1403,6 +1405,7 @@ pub struct GpuLayer {
     pub softmax_uniform: wgpu::Buffer,
     pub error_uniform: wgpu::Buffer,
     pub delta_uniform: wgpu::Buffer,
+    pub update_uniform: wgpu::Buffer,
 
     // metadata
     pub is_output: bool,
@@ -1523,6 +1526,16 @@ impl GpuLayer {
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
+        let update_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Delta Uniform Buffer"),
+            contents: bytemuck::bytes_of(&UpdateUniforms {
+                batch_size: max_batch_size as u32,
+                input_nodes: input_nodes as u32,
+                output_nodes: output_nodes as u32,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
         Self {
             weights_buffer,
             bias_buffer,
@@ -1537,6 +1550,7 @@ impl GpuLayer {
             softmax_uniform,
             error_uniform,
             delta_uniform,
+            update_uniform,
 
             is_output,
             input_nodes,
@@ -1607,5 +1621,10 @@ struct UpdateUniforms {
     pub batch_size: u32,
     pub input_nodes: u32,
     pub output_nodes: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LearningState {
     pub learning_rate: f32,
 }

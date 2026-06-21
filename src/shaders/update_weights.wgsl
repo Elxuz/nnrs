@@ -2,14 +2,20 @@ struct UpdateUniforms {
     batch_size: u32,
     input_nodes: u32,
     output_nodes: u32,
+}
+
+struct LearningState {
     learning_rate: f32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: UpdateUniforms;
-@group(0) @binding(1) var<storage, read> prev_input: array<f32>;
-@group(0) @binding(2) var<storage, read> delta: array<f32>;
-@group(0) @binding(3) var<storage, read_write> weights: array<f32>;
-@group(0) @binding(4) var<storage, read_write> bias: array<f32>;
+@group(0) @binding(1) var<uniform> learning_state: LearningState;
+
+@group(0) @binding(2) var<storage, read> prev_input: array<f32>;
+@group(0) @binding(3) var<storage, read> delta: array<f32>;
+
+@group(0) @binding(4) var<storage, read_write> weights: array<f32>;
+@group(0) @binding(5) var<storage, read_write> bias: array<f32>;
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -30,7 +36,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if weight_grad < -1.0 { weight_grad = -1.0; }
 
         let weight_idx = row * uniforms.output_nodes + col;
-        weights[weight_idx] = weights[weight_idx] - (weight_grad * uniforms.learning_rate);
+        weights[weight_idx] = weights[weight_idx] - (weight_grad * learning_state.learning_rate);
     }
 
     // bias (only first row)
@@ -41,6 +47,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             bias_grad = bias_grad + delta[i * uniforms.output_nodes + col];
         }
 
-        bias[col] = bias[col] - (bias_grad * uniforms.learning_rate);
+        bias[col] = bias[col] - (bias_grad * learning_state.learning_rate);
     }
 }
