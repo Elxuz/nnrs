@@ -21,6 +21,7 @@ pub struct NeuralNetworkGpu {
     pub update_pipeline: Option<wgpu::ComputePipeline>,
 
     // learning state
+    pub timestep: u32,
     pub learning_state: Option<wgpu::Buffer>,
 }
 
@@ -72,7 +73,13 @@ impl NeuralNetworkGpu {
         res.learning_state = Some(res.device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("Learning State Uniform"),
-                contents: bytemuck::bytes_of(&LearningState { learning_rate }),
+                contents: bytemuck::bytes_of(&LearningState {
+                    learning_rate,
+                    beta1: 0.9,
+                    beta2: 0.999,
+                    epsilon: 1e-8,
+                    timestep: 1,
+                }),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             },
         ));
@@ -115,6 +122,7 @@ impl NeuralNetworkGpu {
             error_pipeline: None,
             delta_pipeline: None,
             update_pipeline: None,
+            timestep: 1,
             learning_state: None,
         }
     }
@@ -221,6 +229,14 @@ impl NeuralNetworkGpu {
                     contents: bytemuck::cast_slice(raw_targets),
                     usage: wgpu::BufferUsages::STORAGE,
                 });
+
+        // update timestep for adaptive learning
+        self.queue.write_buffer(
+            self.learning_state.as_ref().unwrap(),
+            std::mem::offset_of!(LearningState, timestep) as u64,
+            bytemuck::bytes_of(&self.timestep),
+        );
+        self.timestep += 1;
 
         let mut encoder = self
             .device
@@ -985,6 +1001,46 @@ impl NeuralNetworkGpu {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
         self.update_pipeline = Some(self.device.create_compute_pipeline(
@@ -1337,6 +1393,22 @@ impl NeuralNetworkGpu {
                     binding: 5,
                     resource: bias_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: layer.weights_m_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: layer.weights_v_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: layer.bias_m_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: layer.bias_v_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -1393,6 +1465,12 @@ pub struct GpuLayer {
     pub weights_buffer: wgpu::Buffer,
     pub bias_buffer: wgpu::Buffer,
 
+    // buffers for adaptive learn rate
+    pub weights_m_buffer: wgpu::Buffer,
+    pub weights_v_buffer: wgpu::Buffer,
+    pub bias_m_buffer: wgpu::Buffer,
+    pub bias_v_buffer: wgpu::Buffer,
+
     // save states for training purposes
     pub prev_input_buffer: wgpu::Buffer,
     pub prev_output_buffer: wgpu::Buffer,
@@ -1437,6 +1515,30 @@ impl GpuLayer {
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let weights_m_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Weights m Buffer"),
+            contents: bytemuck::cast_slice(&vec![0.0_f32; input_nodes * output_nodes]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let weights_v_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Weights v Buffer"),
+            contents: bytemuck::cast_slice(&vec![0.0_f32; input_nodes * output_nodes]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bias_m_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Bias m Buffer"),
+            contents: bytemuck::cast_slice(&vec![0.0_f32; output_nodes]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bias_v_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Bias v Buffer"),
+            contents: bytemuck::cast_slice(&vec![0.0_f32; output_nodes]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let max_input_bytes = max_batch_size * input_nodes * std::mem::size_of::<f32>();
@@ -1540,6 +1642,11 @@ impl GpuLayer {
             weights_buffer,
             bias_buffer,
 
+            weights_m_buffer,
+            weights_v_buffer,
+            bias_m_buffer,
+            bias_v_buffer,
+
             prev_input_buffer,
             prev_output_buffer,
             delta_buffer,
@@ -1627,4 +1734,8 @@ struct UpdateUniforms {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct LearningState {
     pub learning_rate: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub epsilon: f32,
+    pub timestep: u32,
 }

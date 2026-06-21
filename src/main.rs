@@ -29,7 +29,7 @@ enum Commands {
         #[arg(short, default_value_t = 1)]
         batch_size: usize,
         /// which learning rate to start with
-        #[arg(short, default_value_t = 0.005)]
+        #[arg(short, default_value_t = 0.001)]
         learning_rate: f32,
         /// how big individual hidden layers should be
         #[arg(long, num_args(0..))]
