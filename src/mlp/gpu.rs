@@ -109,16 +109,40 @@ impl NeuralNetworkGpu {
 
     pub fn calculate(
         &mut self,
-        encoder: &mut wgpu::CommandEncoder,
+        // encoder: &mut wgpu::CommandEncoder,
         input_buffer: &wgpu::Buffer,
         amount: usize,
     ) -> wgpu::Buffer {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let mut current_working_buffer = input_buffer.clone();
+
+        macro_rules! print_buf {
+            ($buf:expr, $buf_size:expr, $text: expr) => {
+                #[cfg(feature = "print_gpu_debug")]
+                {
+                    self.queue.submit(Some(encoder.finish()));
+
+                    let _res = self.download_matrix_from_gpu(&$buf, $buf_size);
+                    println!($text, _res);
+                    encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                }
+            };
+        }
 
         for layer in &self.layers {
             let a_rows = amount as u32;
             let a_cols = layer.input_nodes as u32;
             let b_cols = layer.output_nodes as u32;
+
+            print_buf!(
+                layer.weights_buffer,
+                (layer.input_nodes * layer.output_nodes * std::mem::size_of::<f32>()) as u64,
+                "Weights: {:?}"
+            );
 
             // save input for training
             let input_bytes = (amount * layer.input_nodes * std::mem::size_of::<f32>()) as u64;
@@ -149,7 +173,7 @@ impl NeuralNetworkGpu {
                 padding: 0,
             };
             self.dispatch_matmul(
-                encoder,
+                &mut encoder,
                 matmul_dims,
                 &current_working_buffer,
                 &layer.weights_buffer,
@@ -158,9 +182,21 @@ impl NeuralNetworkGpu {
 
             // apply ReLU if it isn't the output layer
             if !layer.is_output {
-                self.dispatch_bias_relu(encoder, a_rows, b_cols, &next_buffer, &layer.bias_buffer);
+                self.dispatch_bias_relu(
+                    &mut encoder,
+                    a_rows,
+                    b_cols,
+                    &next_buffer,
+                    &layer.bias_buffer,
+                );
             } else {
-                self.dispatch_bias(encoder, a_rows, b_cols, &next_buffer, &layer.bias_buffer);
+                self.dispatch_bias(
+                    &mut encoder,
+                    a_rows,
+                    b_cols,
+                    &next_buffer,
+                    &layer.bias_buffer,
+                );
             }
 
             // save ouput far training
@@ -176,14 +212,22 @@ impl NeuralNetworkGpu {
             current_working_buffer = next_buffer;
         }
 
+        print_buf!(
+            current_working_buffer,
+            (amount * 10 * std::mem::size_of::<f32>()) as u64,
+            "Result (before sm): {:?}"
+        );
+
         // call softmax on the output
         let last_layer = self.layers.last().unwrap();
         self.dispatch_softmax(
-            encoder,
+            &mut encoder,
             amount as u32,
             last_layer.output_nodes as u32,
             &current_working_buffer,
         );
+
+        self.queue.submit(Some(encoder.finish()));
 
         current_working_buffer
     }
@@ -196,21 +240,6 @@ impl NeuralNetworkGpu {
         learning_rate: f32,
     ) {
         let batch_size = amount as u32;
-
-        macro_rules! print_buf {
-            ($buf:expr, $buf_size:expr, $text: expr) => {
-                #[cfg(feature = "print_gpu_debug")]
-                {
-                    self.queue.submit(Some(encoder.finish()));
-
-                    let _res = self.download_matrix_from_gpu(&$buf, $buf_size);
-                    println!($text, _res);
-                    encoder = self
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                }
-            };
-        }
 
         // load data into vram
         let input_image_buf = self.upload_images_to_gpu(raw_images, amount, 784);
@@ -228,16 +257,39 @@ impl NeuralNetworkGpu {
                 label: Some("Main Training Batch Encoder Forwards Pass"),
             });
 
+        macro_rules! print_buf {
+            ($buf:expr, $buf_size:expr, $text: expr) => {
+                #[cfg(feature = "print_gpu_debug")]
+                {
+                    self.queue.submit(Some(encoder.finish()));
+
+                    let _res = self.download_matrix_from_gpu(&$buf, $buf_size);
+                    println!($text, _res);
+                    encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                }
+            };
+        }
+
+        print_buf!(input_image_buf, (raw_images.len()) as u64, "\nInput: {:?}");
+
         // calculate prediction
-        let prediction_matrix_buf = self.calculate(&mut encoder, &input_image_buf, amount);
+        let prediction_matrix_buf = self.calculate(&input_image_buf, amount);
 
-        self.queue.submit(Some(encoder.finish()));
+        print_buf!(
+            prediction_matrix_buf,
+            (amount * 10 * std::mem::size_of::<f32>()) as u64,
+            "Result: {:?}"
+        );
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Main Training Batch Encoder Backwards Pass"),
-            });
+        // self.queue.submit(Some(encoder.finish()));
+        //
+        // let mut encoder = self
+        //     .device
+        //     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        //         label: Some("Main Training Batch Encoder Backwards Pass"),
+        //     });
 
         // create two error buffers
         let max_neurons = self
@@ -278,11 +330,17 @@ impl NeuralNetworkGpu {
             &error_buf_a,
         );
 
+        print_buf!(
+            error_buf_a,
+            (amount * self.layers.last().unwrap().output_nodes * std::mem::size_of::<f32>()) as u64,
+            "Error: {:?}"
+        );
+
         let mut current_input_error = &error_buf_a;
         let mut current_output_error = &error_buf_b;
 
         // adjust weights and bias through back-propagation
-        for (i, layer) in self.layers.iter().enumerate().rev() {
+        for layer in self.layers.iter().rev() {
             // caluclate delta gradient
             self.dispatch_delta_calc(
                 &mut encoder,
@@ -297,7 +355,23 @@ impl NeuralNetworkGpu {
             print_buf!(
                 layer.delta_buffer,
                 (amount * layer.output_nodes * std::mem::size_of::<f32>()) as u64,
-                "delta {i}: {:?}\n"
+                "Delta: {:?}"
+            );
+
+            let matmul_dims = MatrixTransposeUniforms {
+                a_rows: batch_size,
+                a_cols: layer.output_nodes as u32,
+                b_rows: layer.input_nodes as u32,
+                padding: 0,
+            };
+
+            // prepare error gradient for next layer
+            self.dispatch_matmul_transposed(
+                &mut encoder,
+                matmul_dims,
+                &layer.delta_buffer,
+                &layer.weights_buffer,
+                current_output_error,
             );
 
             // update weights and bias
@@ -314,36 +388,12 @@ impl NeuralNetworkGpu {
             );
 
             print_buf!(
-                layer.weights_buffer,
-                (layer.input_nodes * layer.output_nodes * std::mem::size_of::<f32>()) as u64,
-                "weights {i}: {:?}\n"
+                current_output_error,
+                (amount * layer.input_nodes * std::mem::size_of::<f32>()) as u64,
+                "nError: {:?}"
             );
 
-            print_buf!(
-                layer.bias_buffer,
-                (layer.output_nodes * std::mem::size_of::<f32>()) as u64,
-                "bias {i}: {:?}\n"
-            );
-
-            if i != 0 {
-                let matmul_dims = MatrixTransposeUniforms {
-                    a_rows: batch_size,
-                    a_cols: layer.output_nodes as u32,
-                    b_rows: layer.input_nodes as u32,
-                    padding: 0,
-                };
-
-                // prepare error gradient for next layer
-                self.dispatch_matmul_transposed(
-                    &mut encoder,
-                    matmul_dims,
-                    &layer.delta_buffer,
-                    &layer.weights_buffer,
-                    current_output_error,
-                );
-
-                std::mem::swap(&mut current_input_error, &mut current_output_error);
-            }
+            std::mem::swap(&mut current_input_error, &mut current_output_error);
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -1408,11 +1458,7 @@ impl NeuralNetwork for NeuralNetworkGpu {
     fn test(&mut self, raw_image: &[u8], label: u32) -> bool {
         let buf = self.upload_images_to_gpu(raw_image, 1, 784);
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let res_buf = self.calculate(&mut encoder, &buf, 1);
-        self.queue.submit(Some(encoder.finish()));
+        let res_buf = self.calculate(&buf, 1);
 
         let result =
             self.download_matrix_from_gpu(&res_buf, 10 * std::mem::size_of::<f32>() as u64);
@@ -1458,10 +1504,6 @@ impl GpuLayer {
         max_batch_size: usize,
         is_output: bool,
     ) -> Self {
-        println!(
-            "creating layer with weigths buffer of size: {}",
-            initial_weigths.len()
-        );
         let weights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Layer Weigths"),
             contents: bytemuck::cast_slice(initial_weigths),
@@ -1524,7 +1566,6 @@ fn create_random_vec(size: usize) -> Vec<f32> {
     for _ in 0..size {
         v.push(rand::random_range(-0.5..0.5));
     }
-
     v
 }
 
