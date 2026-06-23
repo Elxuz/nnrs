@@ -85,7 +85,7 @@ fn train(
     let label_data = include_bytes!("../data/train-labels.idx1-ubyte");
 
     let mut a: Box<dyn NeuralNetwork> = match calc_type {
-        CalcType::Cpu => Box::new(NeuralNetworkCpu::new(layers)),
+        CalcType::Cpu => Box::new(NeuralNetworkCpu::new(layers, learning_rate)),
         CalcType::Gpu => Box::new(pollster::block_on(NeuralNetworkGpu::new(
             layers,
             batch_size,
@@ -104,7 +104,7 @@ fn train(
             targets.append(&mut data);
         }
 
-        a.train(buf, &targets, batch_size, learning_rate);
+        a.train(buf, &targets, batch_size);
     };
 
     for epoch in 1..=epochs {
@@ -165,25 +165,6 @@ fn test(input_file: PathBuf, _calc_type: CalcType) {
         if a.test(buf, label[0] as u32) {
             success += 1;
         }
-        // let res = a.calculate(buf, 1);
-        //
-        // let mut max_idx = 0;
-        // let mut cur_idx = 0;
-        // let mut max = 0.;
-        //
-        // for row in res.row_iter() {
-        //     for elem in row.iter() {
-        //         if *elem > max {
-        //             max = *elem;
-        //             max_idx = cur_idx;
-        //         }
-        //         cur_idx += 1;
-        //     }
-        // }
-        //
-        // if max_idx == label[0] {
-        //     success += 1;
-        // }
     }
 
     println!(

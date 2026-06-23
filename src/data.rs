@@ -2,7 +2,7 @@ use faer::Mat;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::mlp::{
-    cpu::{Layer, NeuralNetworkCpu},
+    cpu::{Layer, LearningData, NeuralNetworkCpu},
     gpu::NeuralNetworkGpu,
 };
 
@@ -108,7 +108,18 @@ impl NeuralNetworkData {
 
         layers.push(layer);
 
-        NeuralNetworkCpu { layers }
+        let learning_data = LearningData {
+            learning_rate: 0.001,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            timestep: 1,
+        };
+
+        NeuralNetworkCpu {
+            layers,
+            learning_data,
+        }
     }
 
     pub fn from_nn_gpu(network: &NeuralNetworkGpu) -> Self {

@@ -1,17 +1,18 @@
-use faer::Mat;
+use faer::{Mat, traits::math_utils::sqrt, unzip, zip};
 
 use crate::mlp::NeuralNetwork;
 
-#[derive(PartialEq)]
 pub struct NeuralNetworkCpu {
     pub layers: Vec<Layer>,
+
+    pub learning_data: LearningData,
 }
 
 impl NeuralNetworkCpu {
     pub const INPUT_NODES: usize = 28 * 28;
     pub const OUTPUT_NODES: usize = 10;
 
-    pub fn new(layer_sizes: Vec<usize>) -> Self {
+    pub fn new(layer_sizes: Vec<usize>, learning_rate: f32) -> Self {
         let mut layers = vec![];
 
         for (i, layer_size) in layer_sizes.iter().enumerate() {
@@ -30,7 +31,18 @@ impl NeuralNetworkCpu {
 
         layers.push(Layer::new_output(Self::OUTPUT_NODES, prev_layer_size));
 
-        Self { layers }
+        let learning_data = LearningData {
+            learning_rate,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            timestep: 1,
+        };
+
+        Self {
+            layers,
+            learning_data,
+        }
     }
 
     pub fn calculate(&mut self, input: &[u8], amount: usize) -> Mat<f32> {
@@ -87,13 +99,7 @@ impl NeuralNetworkCpu {
 }
 
 impl NeuralNetwork for NeuralNetworkCpu {
-    fn train(
-        &mut self,
-        raw_images: &[u8],
-        label_data: &[f32],
-        batch_size: usize,
-        learning_rate: f32,
-    ) {
+    fn train(&mut self, raw_images: &[u8], label_data: &[f32], batch_size: usize) {
         assert!(label_data.len() / batch_size == Self::OUTPUT_NODES);
 
         let label_data_mat = Mat::from_fn(batch_size, Self::OUTPUT_NODES, |row, col| {
@@ -104,6 +110,17 @@ impl NeuralNetwork for NeuralNetworkCpu {
 
         // is AxO
         let mut error_grad = (result - label_data_mat).map(|val| val / batch_size as f32);
+
+        let bias_correction1 = 1.0
+            - self
+                .learning_data
+                .beta1
+                .powi(self.learning_data.timestep as i32);
+        let bias_correction2 = 1.0
+            - self
+                .learning_data
+                .beta2
+                .powi(self.learning_data.timestep as i32);
 
         for layer in self.layers.iter_mut().rev() {
             // is AxO
@@ -122,17 +139,55 @@ impl NeuralNetwork for NeuralNetworkCpu {
 
             // is IxA * AxO => IxO
             let delta_weights = prev_input.transpose() * &delta;
-            let delta_weights = delta_weights.map(|val| val.clamp(-1.0, 1.0));
 
             let ones = Mat::<f32>::from_fn(1, delta.nrows(), |_, _| 1.0);
             let delta_bias = &ones * &delta;
 
+            // constant rate learning
+            // let delta_weights = delta_weights.map(|val| val.clamp(-1.0, 1.0));
+
+            // dynamic rate learning
+            layer.weights_m.data = layer
+                .weights_m
+                .data
+                .map(|val| val * self.learning_data.beta1)
+                + delta_weights.map(|val| val * (1.0 - self.learning_data.beta1));
+            layer.weights_v.data = layer
+                .weights_v
+                .data
+                .map(|val| val * self.learning_data.beta2)
+                + delta_weights.map(|val| val.powi(2) * (1.0 - self.learning_data.beta2));
+
+            let m_hat = layer.weights_m.data.map(|val| val * bias_correction1);
+            let v_hat = layer.weights_v.data.map(|val| val * bias_correction2);
+
+            layer.bias_m.data = layer.bias_m.data.map(|val| val * self.learning_data.beta1)
+                + delta_bias.map(|val| val * (1.0 - self.learning_data.beta1));
+            layer.bias_v.data = layer.bias_v.data.map(|val| val * self.learning_data.beta2)
+                + delta_bias.map(|val| val.powi(2) * (1.0 - self.learning_data.beta2));
+
+            let b_m_hat = layer.bias_m.data.map(|val| val * bias_correction1);
+            let b_v_hat = layer.bias_v.data.map(|val| val * bias_correction2);
+
             // is AxO * OxI => AxI
             error_grad = &delta * layer.weights.data.transpose();
 
-            layer.weights.data -= delta_weights.map(|val| val * learning_rate);
-            layer.bias.data -= delta_bias.map(|val| val * learning_rate);
+            // constant rate learning
+            // layer.weights.data -= delta_weights.map(|val| val * self.learning_data.learning_rate);
+            // layer.bias.data -= delta_bias.map(|val| val * self.learning_data.learning_rate);
+
+            // dynamic rate learning
+            layer.weights.data -= zip!(&m_hat, &v_hat).map(|unzip!(m_hat, v_hat)| {
+                (self.learning_data.learning_rate / (sqrt(v_hat) + self.learning_data.epsilon))
+                    * m_hat
+            });
+            layer.bias.data -= zip!(&b_m_hat, &b_v_hat).map(|unzip!(m_hat, v_hat)| {
+                (self.learning_data.learning_rate / (sqrt(v_hat) + self.learning_data.epsilon))
+                    * m_hat
+            });
         }
+
+        self.learning_data.timestep += 1;
     }
 
     fn test(&mut self, raw_image: &[u8], label: u32) -> bool {
@@ -168,25 +223,38 @@ pub struct Layer {
 
     prev_input: Option<Tensor2D>,
     prev_output: Option<Tensor2D>,
+
+    bias_m: Tensor,
+    bias_v: Tensor,
+    weights_m: Tensor2D,
+    weights_v: Tensor2D,
 }
 
 impl Layer {
     pub fn new(size: usize, prev_layer_size: usize) -> Self {
         Self {
-            bias: Tensor::new(size),
-            weights: Tensor2D::new(prev_layer_size, size),
+            bias: Tensor::new_random(size),
+            weights: Tensor2D::new_random(prev_layer_size, size),
             prev_input: None,
             prev_output: None,
+            bias_m: Tensor::new(size),
+            bias_v: Tensor::new(size),
+            weights_m: Tensor2D::new(prev_layer_size, size),
+            weights_v: Tensor2D::new(prev_layer_size, size),
             is_output: false,
         }
     }
 
     pub fn new_output(size: usize, prev_layer_size: usize) -> Self {
         Self {
-            bias: Tensor::new(size),
-            weights: Tensor2D::new(prev_layer_size, size),
+            bias: Tensor::new_random(size),
+            weights: Tensor2D::new_random(prev_layer_size, size),
             prev_input: None,
             prev_output: None,
+            bias_m: Tensor::new(size),
+            bias_v: Tensor::new(size),
+            weights_m: Tensor2D::new(prev_layer_size, size),
+            weights_v: Tensor2D::new(prev_layer_size, size),
             is_output: true,
         }
     }
@@ -200,6 +268,12 @@ pub struct Tensor {
 impl Tensor {
     pub fn new(height: usize) -> Self {
         Self {
+            data: Mat::zeros(1, height),
+        }
+    }
+
+    pub fn new_random(height: usize) -> Self {
+        Self {
             data: Mat::from_fn(1, height, |_, _| rand::random_range(-0.5..0.5)),
         }
     }
@@ -212,6 +286,11 @@ pub struct Tensor2D {
 
 impl Tensor2D {
     pub fn new(width: usize, height: usize) -> Self {
+        let data: Mat<f32> = Mat::zeros(width, height);
+        Self { data }
+    }
+
+    pub fn new_random(width: usize, height: usize) -> Self {
         let data: Mat<f32> = Mat::from_fn(width, height, |_, _| rand::random_range(-0.5..0.5));
         Self { data }
     }
@@ -219,4 +298,12 @@ impl Tensor2D {
     pub fn from_mat(mat: Mat<f32>) -> Self {
         Self { data: mat }
     }
+}
+
+pub struct LearningData {
+    pub learning_rate: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub epsilon: f32,
+    pub timestep: u32,
 }

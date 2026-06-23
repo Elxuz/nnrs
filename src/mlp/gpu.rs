@@ -1509,13 +1509,7 @@ impl NeuralNetworkGpu {
 }
 
 impl NeuralNetwork for NeuralNetworkGpu {
-    fn train(
-        &mut self,
-        raw_images: &[u8],
-        label_data: &[f32],
-        batch_size: usize,
-        _learning_rate: f32,
-    ) {
+    fn train(&mut self, raw_images: &[u8], label_data: &[f32], batch_size: usize) {
         self.train(raw_images, label_data, batch_size);
     }
 
