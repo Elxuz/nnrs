@@ -145,7 +145,10 @@ fn test(input_file: PathBuf, _calc_type: CalcType) {
     let input_file = File::open(std::env::current_dir().unwrap().join(input_file)).unwrap();
     let data: NeuralNetworkData = serde_json::from_reader(input_file).unwrap();
 
-    let mut a = data.to_nn_cpu();
+    let mut a: Box<dyn NeuralNetwork> = match _calc_type {
+        CalcType::Cpu => Box::new(data.to_nn_cpu()),
+        CalcType::Gpu => Box::new(data.to_nn_gpu()),
+    };
 
     let pixel_data = include_bytes!("../data/t10k-images.idx3-ubyte");
     let label_data = include_bytes!("../data/t10k-labels.idx1-ubyte");
@@ -159,25 +162,28 @@ fn test(input_file: PathBuf, _calc_type: CalcType) {
         }
 
         let (buf, label) = get_image(pixel_data, label_data, i, 1);
-        let res = a.calculate(buf, 1);
-
-        let mut max_idx = 0;
-        let mut cur_idx = 0;
-        let mut max = 0.;
-
-        for row in res.row_iter() {
-            for elem in row.iter() {
-                if *elem > max {
-                    max = *elem;
-                    max_idx = cur_idx;
-                }
-                cur_idx += 1;
-            }
-        }
-
-        if max_idx == label[0] {
+        if a.test(buf, label[0] as u32) {
             success += 1;
         }
+        // let res = a.calculate(buf, 1);
+        //
+        // let mut max_idx = 0;
+        // let mut cur_idx = 0;
+        // let mut max = 0.;
+        //
+        // for row in res.row_iter() {
+        //     for elem in row.iter() {
+        //         if *elem > max {
+        //             max = *elem;
+        //             max_idx = cur_idx;
+        //         }
+        //         cur_idx += 1;
+        //     }
+        // }
+        //
+        // if max_idx == label[0] {
+        //     success += 1;
+        // }
     }
 
     println!(

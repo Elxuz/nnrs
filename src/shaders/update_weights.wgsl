@@ -48,6 +48,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             weight_grad = weight_grad + prev_input[input_idx] * delta[delta_idx];
         }
 
+        weight_grad = weight_grad / f32(uniforms.batch_size);
+
         // constant learn rate scaling
         // if weight_grad > 1.0 { weight_grad = 1.0; }
         // if weight_grad < -1.0 { weight_grad = -1.0; }

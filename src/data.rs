@@ -155,4 +155,14 @@ impl NeuralNetworkData {
             bias,
         }
     }
+
+    pub fn to_nn_gpu(&self) -> NeuralNetworkGpu {
+        pollster::block_on(NeuralNetworkGpu::new_with_weigths(
+            &self.hidden_layers,
+            &self.weights,
+            &self.bias,
+            1,
+            0.1,
+        ))
+    }
 }

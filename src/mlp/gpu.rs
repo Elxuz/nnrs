@@ -87,6 +87,91 @@ impl NeuralNetworkGpu {
         res
     }
 
+    pub async fn new_with_weigths(
+        layer_sizes: &[usize],
+        weights: &[f32],
+        bias: &[f32],
+        max_batch_size: usize,
+        learning_rate: f32,
+    ) -> Self {
+        let mut res = Self::init().await;
+        res.create_matmul_pipeline();
+        res.create_matmul_transposed_pipeline();
+        res.create_bias_pipeline();
+        res.create_bias_relu_pipeline();
+        res.create_softmax_pipeline();
+        res.create_error_pipeline();
+        res.create_delta_pipeline();
+        res.create_update_pipeline();
+
+        let mut num_weights = 0;
+        let mut num_bias = 0;
+
+        for (i, size) in layer_sizes.iter().enumerate() {
+            let input = match i {
+                0 => 784,
+                _ => layer_sizes[i - 1],
+            };
+
+            num_weights += input * *size;
+            num_bias += *size;
+        }
+
+        let input = match layer_sizes.len() {
+            0 => 784,
+            _ => *layer_sizes.last().unwrap(),
+        };
+
+        num_weights += input * 10;
+        num_bias += 10;
+
+        assert!(num_weights == weights.len());
+        assert!(num_bias == bias.len());
+
+        let mut w_idx = 0;
+        let mut b_idx = 0;
+
+        for (i, size) in layer_sizes.iter().enumerate() {
+            let input_nodes = match i {
+                0 => 784,
+                _ => layer_sizes[i - 1],
+            };
+            let layer = GpuLayer::new(
+                &res.device,
+                input_nodes,
+                *size,
+                &weights[w_idx..w_idx + input_nodes * *size],
+                &bias[b_idx..b_idx + *size],
+                max_batch_size,
+                false,
+            );
+
+            w_idx += input_nodes * *size;
+            b_idx += *size;
+
+            res.layers.push(layer);
+        }
+
+        let input_nodes = match layer_sizes.len() {
+            0 => 784,
+            _ => *layer_sizes.last().unwrap(),
+        };
+
+        let layer = GpuLayer::new(
+            &res.device,
+            input_nodes,
+            10,
+            &weights[w_idx..w_idx + input_nodes * 10],
+            &bias[b_idx..b_idx + 10],
+            max_batch_size,
+            true,
+        );
+
+        res.layers.push(layer);
+
+        res
+    }
+
     pub async fn init() -> Self {
         let instance = wgpu::Instance::default();
 
