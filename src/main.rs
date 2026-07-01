@@ -1,194 +1,149 @@
-use std::{fs::File, io::Write, path::PathBuf};
-
-use clap::Parser;
-
-use crate::{
-    data::NeuralNetworkData,
-    mlp::{NeuralNetwork, cpu::NeuralNetworkCpu, gpu::NeuralNetworkGpu},
+use std::{
+    fs::File,
+    io::{Read, Seek, Write},
 };
 
-mod data;
+use crate::mlp::{MLPDescriptor, MultiLayerPerceptron};
 mod mlp;
 
-#[derive(clap_derive::Parser, Debug)]
-struct Args {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(clap_derive::Subcommand, Debug)]
-enum Commands {
-    /// Train a model
-    Train {
-        /// name of the file to use for the output
-        output_file: PathBuf,
-        /// the number of times the mnist dataset is used for training
-        #[arg(short, default_value_t = 1)]
-        epochs: usize,
-        /// how many images are used for a single training iteration
-        #[arg(short, default_value_t = 1)]
-        batch_size: usize,
-        /// which learning rate to start with
-        #[arg(short, default_value_t = 0.001)]
-        learning_rate: f32,
-        /// how big individual hidden layers should be
-        #[arg(long, num_args(0..))]
-        layers: Vec<usize>,
-        /// whether to use the cpu-algorithm or the gpu-algorithm
-        #[arg(short, value_enum, default_value_t = CalcType::Cpu)]
-        calc_type: CalcType,
-    },
-    /// Test a model
-    Test {
-        /// path to the file containing trained model
-        input_file: PathBuf,
-        /// Not implemented for gpu bound testing
-        #[arg(short, value_enum, default_value_t = CalcType::Cpu)]
-        calc_type: CalcType,
-    },
-}
-
-#[derive(clap_derive::ValueEnum, Debug, Clone, PartialEq)]
-enum CalcType {
-    Cpu,
-    Gpu,
-}
-
 fn main() {
-    let args = Args::parse();
+    const BATCH_SIZE: u32 = 1024;
+    let mut mlp = MultiLayerPerceptron::new(&MLPDescriptor {
+        learning_rate: 0.001,
+        input_size: 784,
+        output_size: 10,
+        max_batch_size: BATCH_SIZE,
+        h_layer_sizes: vec![1024, 1024, 1024],
+    });
 
-    match args.command {
-        Commands::Train {
-            output_file: out,
-            epochs,
-            batch_size,
-            learning_rate,
-            layers,
-            calc_type,
-        } => train(out, epochs, batch_size, learning_rate, layers, calc_type),
-        Commands::Test {
-            input_file: input,
-            calc_type,
-        } => test(input, calc_type),
-    }
-}
+    let mut data_file =
+        File::open("./data/train-images.idx3-ubyte").expect("Failed to open training data");
+    let mut label_file =
+        File::open("./data/train-labels.idx1-ubyte").expect("Failed to open training data labels");
 
-fn train(
-    output_file: PathBuf,
-    epochs: usize,
-    batch_size: usize,
-    learning_rate: f32,
-    layers: Vec<usize>,
-    calc_type: CalcType,
-) {
-    let pixel_data = include_bytes!("../data/train-images.idx3-ubyte");
-    let label_data = include_bytes!("../data/train-labels.idx1-ubyte");
+    let mult_train = BATCH_SIZE / 600 + 1;
 
-    let mut a: Box<dyn NeuralNetwork> = match calc_type {
-        CalcType::Cpu => Box::new(NeuralNetworkCpu::new(layers, learning_rate)),
-        CalcType::Gpu => Box::new(pollster::block_on(NeuralNetworkGpu::new(
-            layers,
-            batch_size,
-            learning_rate,
-        ))),
-    };
+    let mult_test = BATCH_SIZE / 100 + 1;
 
-    let train_bp = |a: &mut Box<dyn NeuralNetwork>, offset: usize, batch_size: usize| {
-        let (buf, label) = get_image(pixel_data, label_data, offset, batch_size);
-
-        let mut targets = Vec::new();
-
-        for target in label {
-            let mut data = vec![0f32; 10];
-            data[*target as usize] = 1.0;
-            targets.append(&mut data);
-        }
-
-        a.train(buf, &targets, batch_size);
-    };
-
-    for epoch in 1..=epochs {
-        for i in 0..60000 / batch_size {
-            if i % (600 / batch_size) == 0 {
-                print!("\rCurrently at epoch {epoch} {}%", i * batch_size / 600);
+    for epoch in 0..5 {
+        for i in 0..(60000 / BATCH_SIZE) {
+            if i % (600 * mult_train / BATCH_SIZE) == 0 {
+                print!(
+                    "\repoch {epoch}: {:.0}% done",
+                    i as f32 / (600. / BATCH_SIZE as f32)
+                );
                 std::io::stdout().flush().unwrap();
             }
+            let (data, labels) = load_data(
+                &mut data_file,
+                &mut label_file,
+                BATCH_SIZE as usize * i as usize,
+                BATCH_SIZE as usize,
+            );
 
-            train_bp(&mut a, batch_size * i, batch_size);
+            let data = convert_data(data);
+            let labels = convert_labels(labels);
+
+            mlp.load_data(&data, &labels, BATCH_SIZE);
+            mlp.train();
         }
 
-        let leftover = 60000 % batch_size;
-        if leftover == 0 {
-            continue;
-        }
+        let leftover = 60000 % BATCH_SIZE;
+        let (data, labels) = load_data(
+            &mut data_file,
+            &mut label_file,
+            60000 - leftover as usize - 1,
+            leftover as usize,
+        );
 
-        train_bp(&mut a, 60000 - leftover - 1, leftover);
+        let data = convert_data(data);
+        let labels = convert_labels(labels);
+
+        mlp.load_data(&data, &labels, leftover);
+        mlp.train();
     }
-    print!("\r\x1b[2Ksaving...");
-    std::io::stdout().flush().unwrap();
+    println!("\r\x1b[2Ktraining done...");
 
-    let save = match calc_type {
-        CalcType::Cpu => {
-            NeuralNetworkData::from_nn_cpu(a.as_any().downcast_ref::<NeuralNetworkCpu>().unwrap())
-        }
-        CalcType::Gpu => {
-            NeuralNetworkData::from_nn_gpu(a.as_any().downcast_ref::<NeuralNetworkGpu>().unwrap())
-        }
-    };
-    let mut output_file = File::create(std::env::current_dir().unwrap().join(output_file)).unwrap();
-    let _ = serde_json::to_writer(&mut output_file, &save);
+    let mut data_file =
+        File::open("./data/t10k-images.idx3-ubyte").expect("Failed to open testing data");
+    let mut label_file =
+        File::open("./data/t10k-labels.idx1-ubyte").expect("Failed to open testing data labels");
 
-    println!("\r\x1b[2Kfinished.");
-}
-
-fn test(input_file: PathBuf, _calc_type: CalcType) {
-    let input_file = File::open(std::env::current_dir().unwrap().join(input_file)).unwrap();
-    let data: NeuralNetworkData = serde_json::from_reader(input_file).unwrap();
-
-    let mut a: Box<dyn NeuralNetwork> = match _calc_type {
-        CalcType::Cpu => Box::new(data.to_nn_cpu()),
-        CalcType::Gpu => Box::new(data.to_nn_gpu()),
-    };
-
-    let pixel_data = include_bytes!("../data/t10k-images.idx3-ubyte");
-    let label_data = include_bytes!("../data/t10k-labels.idx1-ubyte");
-
-    let mut success = 0;
-
-    for i in 0..10000 {
-        if i % 100 == 0 {
-            print!("\rCurrently at {}%", i / 100);
+    let mut correct = 0;
+    for i in 0..(10000 / BATCH_SIZE) {
+        if i % (100 * mult_test / BATCH_SIZE) == 0 {
+            print!("\r{}% done", i as f32 / (100. / BATCH_SIZE as f32));
             std::io::stdout().flush().unwrap();
         }
 
-        let (buf, label) = get_image(pixel_data, label_data, i, 1);
-        if a.test(buf, label[0] as u32) {
-            success += 1;
+        let (data, labels) = load_data(
+            &mut data_file,
+            &mut label_file,
+            BATCH_SIZE as usize * i as usize,
+            BATCH_SIZE as usize,
+        );
+
+        let data = convert_data(data);
+        let labels = convert_labels(labels);
+
+        mlp.load_data(&data, &labels, BATCH_SIZE);
+        correct += mlp.test();
+    }
+
+    let leftover = 10000 % BATCH_SIZE;
+
+    let (data, labels) = load_data(
+        &mut data_file,
+        &mut label_file,
+        10000 - leftover as usize - 1,
+        leftover as usize,
+    );
+
+    let data = convert_data(data);
+    let labels = convert_labels(labels);
+
+    mlp.load_data(&data, &labels, leftover);
+    correct += mlp.test();
+
+    println!("\rcorrect: {}/10000 ({}%)", correct, correct as f32 / 100.);
+}
+
+fn load_data(
+    data_file: &mut File,
+    label_file: &mut File,
+    offset: usize,
+    amount: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    const IMAGE_SIZE: usize = 28 * 28;
+    // go to offset
+    let _ = data_file.seek(std::io::SeekFrom::Start((16 + IMAGE_SIZE * offset) as u64));
+    let _ = label_file.seek(std::io::SeekFrom::Start((8 + offset) as u64));
+
+    let mut data_buf = vec![0u8; IMAGE_SIZE * amount];
+    let mut label_buf = vec![0u8; amount];
+
+    let _ = data_file.read_exact(&mut data_buf);
+    let _ = label_file.read_exact(&mut label_buf);
+
+    (data_buf, label_buf)
+}
+
+fn convert_data(data: Vec<u8>) -> Vec<f32> {
+    data.iter().map(|val| *val as f32 / 255.).collect()
+}
+
+fn convert_labels(labels: Vec<u8>) -> Vec<f32> {
+    let mut res = Vec::with_capacity(labels.len() * 10);
+
+    for label in labels {
+        for i in 0..10 {
+            if i == label {
+                res.push(1_f32);
+            } else {
+                res.push(0_f32);
+            }
         }
     }
 
-    println!(
-        "\rpassed {success}/10000 tests ({}%)",
-        success as f32 / 10000. * 100.
-    );
-}
-
-fn get_image<'a, 'b>(
-    pixel_data: &'a [u8],
-    label_data: &'b [u8],
-    idx: usize,
-    amount: usize,
-) -> (&'a [u8], &'b [u8]) {
-    if idx >= pixel_data.len() {
-        panic!()
-    }
-
-    const IMAGE_SIZE: usize = 28 * 28;
-
-    // skip file header
-    let buf = &pixel_data[16 + IMAGE_SIZE * idx..16 + IMAGE_SIZE * (idx + amount)];
-
-    let label = &label_data[8 + idx..8 + idx + amount];
-
-    (buf, label)
+    res
 }
